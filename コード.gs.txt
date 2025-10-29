@@ -1,0 +1,381 @@
+// 【Portfolio Version: Payment Notification PDF Automation - Final】
+// This script automates the creation of payment notification PDFs from a source Google Sheet,
+// saves them to Google Drive, and updates the status in the source sheet.
+
+// =================================================================
+// ★ Main Function: Creates PDF files and updates status ★
+// =================================================================
+/**
+ * Reads data from the source sheet, filters rows for the current month with empty status,
+ * generates payment notification sheets grouped by agent, creates PDFs, saves them to Drive,
+ * and updates the status column in the source sheet to 'Pending Approval'.
+ */
+function createPaymentPdfs() {
+
+  // --- Configuration ---
+  // IDs and Names
+  const SOURCE_SHEET_ID = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"; // ★ダミーに置き換え★ Source Google Sheet ID (Management Table)
+  const SOURCE_SHEET_NAME = "RecruitmentFee_Management"; // ★シート名を変更★ Name of the sheet containing the data
+  const TEMPLATE_FILE_ID = "YYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY";  // ★ダミーに置き換え★ Template Google Sheet ID (Payment Notification Format)
+  const TEMPLATE_SHEET_NAME = "FMT";                                        // Name of the template sheet to copy
+  const PDF_FOLDER_ID = "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ";               // ★ダミーに置き換え★ Google Drive Folder ID to save PDFs
+
+  // Source Sheet Column Settings (0-based index)
+  const START_DATA_ROW = 2;              // Data starts from this row number
+  const COL_IDX = {                      // Column indices in the source sheet
+    COMPANY_NAME: 1,                   // B: Recruiting Company Name
+    AGENT_NAME: 16,                    // Q: Agent Name (Used for grouping)
+    PAYMENT_MONTH: 19,                 // T: Payment Month (Date format expected)
+    PAYMENT_AMOUNT: 20,                // U: Payment Amount
+    BANK_ACCOUNT: 22,                  // W: Bank Account Info
+    STATUS: 25                         // Z: Status Column
+  };
+  const GROUPING_COLUMN_INDEX = COL_IDX.AGENT_NAME; // Group by Agent Name (Q)
+
+  // Output Sheet/PDF Naming
+  const NEW_SHEET_SUFFIX = "様_支払い通知書"; // Suffix for the generated sheet/PDF name
+
+  // Template Sheet Cell Settings
+  const DETAIL_START_ROW = 14;           // Row number where detail lines begin (e.g., H14, X14)
+
+  // Font Size Settings
+  const FONT_H = {                       // Settings for H column (Company Name) in the template
+    NORMAL: 10,
+    SMALL: 8,
+    LENGTH_THRESHOLD: 20                // Character count threshold for shrinking
+  };
+  const FONT_F9 = {                      // Settings for F9 cell (Bank Account) in the template
+    NORMAL: 8,                         // Font size for 5 lines or less
+    SMALL: 6,                          // Font size for 6 lines or more
+    LINE_THRESHOLD: 6                  // Line count threshold (based on '\n')
+  };
+
+  // Status Tags
+  const STATUS_TO_UPDATE = "承認待ち";   // Status to set after successful PDF creation
+
+  // --- End of Configuration ---
+
+
+  try {
+    // --- Get current year and month for filtering and naming ---
+    const today = new Date();
+    const currentYear = today.getFullYear();
+    const currentMonth = today.getMonth(); // 0-indexed (January is 0)
+    const yearYY = currentYear.toString().slice(-2);
+    const monthMM = (currentMonth + 1).toString().padStart(2, '0');
+    const sheetNamePrefix = yearYY + monthMM + "_"; // e.g., "2510_"
+
+    // --- 1. Load data from the source sheet ---
+    const sourceSs = SpreadsheetApp.openById(SOURCE_SHEET_ID);
+    const sourceSheet = sourceSs.getSheetByName(SOURCE_SHEET_NAME);
+    if (!sourceSheet) {
+      throw new Error(`Source sheet "${SOURCE_SHEET_NAME}" not found.`);
+    }
+
+    const lastRow = sourceSheet.getLastRow();
+    if (lastRow < START_DATA_ROW) {
+       Browser.msgBox(`No data found in sheet "${SOURCE_SHEET_NAME}" from row ${START_DATA_ROW}.`);
+       return;
+    }
+    const lastCol = sourceSheet.getLastColumn();
+    const numRows = lastRow - START_DATA_ROW + 1;
+
+    // Read all data from START_DATA_ROW to the last row/column
+    const allDataRange = sourceSheet.getRange(START_DATA_ROW, 1, numRows, lastCol);
+    const allValues = allDataRange.getValues();
+
+    // --- 1.5. Filter data and pre-aggregate totals ---
+    let dataToProcess = []; // Holds rows that pass the filter, along with original row number
+    let totalsByGroup = {};   // Holds sum of payment amounts for each agent
+
+    for (let j = 0; j < allValues.length; j++) {
+      const row = allValues[j];
+      const originalRowNum = START_DATA_ROW + j;
+
+      const paymentMonthDate = row[COL_IDX.PAYMENT_MONTH];
+      const agentName = row[COL_IDX.AGENT_NAME];
+      const paymentAmount = parseFloat(row[COL_IDX.PAYMENT_AMOUNT]) || 0; // Default to 0 if not a number
+      const currentStatus = row[COL_IDX.STATUS];
+
+      // --- Filtering Conditions ---
+      let isTargetMonth = false;
+      if (paymentMonthDate instanceof Date) {
+        if (paymentMonthDate.getFullYear() === currentYear && paymentMonthDate.getMonth() === currentMonth) {
+          isTargetMonth = true;
+        }
+      }
+
+      // Process row if: 1. Payment month is the current month, AND 2. Status is empty
+      if (isTargetMonth && currentStatus === "") {
+        // Add row to processing list
+        dataToProcess.push({
+          values: row,
+          originalRow: originalRowNum
+        });
+
+        // Pre-aggregate totals (using Payment Amount from Col U)
+        totalsByGroup[agentName] = (totalsByGroup[agentName] || 0) + paymentAmount;
+      }
+    } // --- End of filtering and aggregation ---
+
+    if (dataToProcess.length === 0) {
+       Browser.msgBox("No data found matching the criteria (Payment Month is current, Status is empty).");
+       return;
+    }
+
+    // --- Sort data by grouping key (Agent Name) for proper grouping ---
+    dataToProcess.sort((a, b) => {
+      const keyA = a.values[GROUPING_COLUMN_INDEX];
+      const keyB = b.values[GROUPING_COLUMN_INDEX];
+      return keyA.localeCompare(keyB);
+    });
+
+    // --- 2. Prepare Template Sheet and Destination Folder ---
+    const templateSs = SpreadsheetApp.openById(TEMPLATE_FILE_ID);
+    const templateSheet = templateSs.getSheetByName(TEMPLATE_SHEET_NAME);
+    if (!templateSheet) {
+        throw new Error(`Template sheet "${TEMPLATE_SHEET_NAME}" not found.`);
+    }
+
+    // Get the destination folder by ID
+    let destinationFolder;
+    try {
+        destinationFolder = DriveApp.getFolderById(PDF_FOLDER_ID);
+    } catch (e) {
+        throw new Error(`Invalid PDF destination folder ID "${PDF_FOLDER_ID}" or insufficient permissions.`);
+    }
+    const destinationFolderName = destinationFolder.getName(); // Get name for messages
+
+    // --- 3. Initialize Grouping Variables ---
+    let currentGroupKey = "";
+    let currentSheet = null;
+    let detailRowOffset = 0;
+    let sheetCount = 0;
+    let rowsToUpdateForCurrentSheet = []; // Store original row numbers for status update
+
+    // --- 4. Process Data Row by Row ---
+    for (let i = 0; i < dataToProcess.length; i++) {
+
+      const currentRowData = dataToProcess[i];
+      const currentRowValues = currentRowData.values;
+      const originalRowNum = currentRowData.originalRow;
+
+      const companyName = currentRowValues[COL_IDX.COMPANY_NAME];   // B -> H14
+      const agentName = currentRowValues[COL_IDX.AGENT_NAME];     // Q -> Group Key / B4
+      const paymentAmount = currentRowValues[COL_IDX.PAYMENT_AMOUNT]; // U -> X14
+      const bankAccountInfo = currentRowValues[COL_IDX.BANK_ACCOUNT]; // W -> F9
+
+      // Check if the group key (Agent Name) has changed
+      if (agentName !== currentGroupKey) {
+
+        // --- Finalize previous sheet (if exists): Create PDF and Update Tags ---
+        if (currentSheet !== null) {
+          const pdfSuccess = createPdf(templateSs, currentSheet, destinationFolder); // Pass templateSs
+          if (pdfSuccess) {
+            updateTags(sourceSheet, rowsToUpdateForCurrentSheet, STATUS_TO_UPDATE);
+          }
+        }
+
+        // --- Start processing a new group (new Agent) ---
+        currentGroupKey = agentName;
+        detailRowOffset = 0; // Reset detail row counter for the new sheet
+        sheetCount++;
+        rowsToUpdateForCurrentSheet = [originalRowNum]; // Start list for status update
+
+        // Create the new sheet by copying the template
+        const newSheetName = sheetNamePrefix + currentGroupKey + NEW_SHEET_SUFFIX;
+        currentSheet = templateSheet.copyTo(templateSs); // Copy within the template file first
+        try {
+          currentSheet.setName(newSheetName); // Rename the copied sheet
+        } catch (e) {
+          // Handle potential duplicate sheet name error if script is re-run partially
+          Logger.log(`Sheet rename failed (likely duplicate): ${newSheetName}. Error: ${e.message}`);
+          currentSheet.setName(newSheetName + "_copy_" + Date.now()); // Append timestamp
+        }
+        currentSheet.showSheet(); // Make the new sheet visible
+
+        // Write header/master data to the new sheet
+        currentSheet.getRange("B4").setValue(currentGroupKey); // Agent Name (Q)
+
+        const f9Cell = currentSheet.getRange("F9");
+        f9Cell.setValue(bankAccountInfo); // Bank Account Info (W)
+
+        // Adjust F9 font size based on line count
+        let lineCount = 1;
+        if (bankAccountInfo) {
+          lineCount = (bankAccountInfo.toString().match(/\n/g) || []).length + 1;
+        }
+        f9Cell.setFontSize(lineCount >= FONT_F9.LINE_THRESHOLD ? FONT_F9.SMALL : FONT_F9.NORMAL);
+        f9Cell.setWrap(true); // Ensure wrapping is enabled
+        f9Cell.setVerticalAlignment("middle");
+
+        // Write totals (Subtotal, Tax, Grand Total)
+        const subTotal = totalsByGroup[currentGroupKey];
+        const tax = Math.floor(subTotal * 0.1);
+        const grandTotal = subTotal + tax;
+        currentSheet.getRange("Z15").setValue(subTotal);
+        currentSheet.getRange("Z16").setValue(tax);
+        currentSheet.getRange("Z17").setValue(grandTotal);
+
+      } else {
+        // --- Add detail row to the existing group (same Agent) ---
+        detailRowOffset++; // Increment detail row counter
+        rowsToUpdateForCurrentSheet.push(originalRowNum); // Add row to status update list
+
+        const insertRowAt = DETAIL_START_ROW + detailRowOffset;
+        const sourceFormatRow = insertRowAt - 1; // Row to copy format/formulas from
+
+        // Insert a new row
+        currentSheet.insertRows(insertRowAt, 1);
+
+        // Copy everything (format, values, formulas) from the row above
+        currentSheet.getRange(sourceFormatRow, 1, 1, currentSheet.getMaxColumns()).copyTo(
+          currentSheet.getRange(insertRowAt, 1),
+          SpreadsheetApp.CopyPasteType.PASTE_NORMAL,
+          false
+        );
+
+        // Increment the value in column F (assuming it's a sequence number in the template)
+        const fValueAbove = parseFloat(currentSheet.getRange("F" + sourceFormatRow).getValue()) || 0;
+        currentSheet.getRange("F" + insertRowAt).setValue(fValueAbove + 1);
+      }
+
+      // --- Write detail data (H and X columns) for the current row ---
+      // This runs for both the first row of a new group and subsequent rows
+      const currentRowNumber = DETAIL_START_ROW + detailRowOffset;
+
+      // Write Company Name to H column
+      const hCellAddress = "H" + currentRowNumber;
+      const hCellText = `紹介手数料（${companyName}）`; // Format as requested
+      const hCell = currentSheet.getRange(hCellAddress);
+      hCell.setValue(hCellText);
+
+      // Adjust H column font size based on character length
+      hCell.setFontSize(hCellText.length > FONT_H.LENGTH_THRESHOLD ? FONT_H.SMALL : FONT_H.NORMAL);
+      hCell.setWrap(false); // Disable wrapping for H (shrink instead)
+      hCell.setVerticalAlignment("middle");
+
+      // Write Payment Amount to X column
+      const xCellAddress = "X" + currentRowNumber;
+      currentSheet.getRange(xCellAddress).setValue(paymentAmount); // Payment Amount (U)
+
+    } // --- End of loop through dataToProcess ---
+
+    // --- Finalize the very last sheet created ---
+    if (currentSheet !== null) {
+      const pdfSuccess = createPdf(templateSs, currentSheet, destinationFolder); // Pass templateSs
+      if (pdfSuccess) {
+        updateTags(sourceSheet, rowsToUpdateForCurrentSheet, STATUS_TO_UPDATE);
+      }
+    }
+
+    Browser.msgBox(`${sheetCount} payment notification sheets created.\nPDFs saved to folder "${destinationFolderName}".\n(${dataToProcess.length} rows processed)`);
+
+  } catch (e) {
+    // Log detailed error and show a user-friendly message
+    Logger.log(`Error in createPaymentPdfs: ${e.message}\n${e.stack}`);
+    Browser.msgBox(`An error occurred: ${e.message}\nSee execution log for details.`);
+  }
+}
+
+
+// =================================================================
+// ★ Helper Function: Creates PDF from a sheet and saves to Drive ★
+// =================================================================
+/**
+ * Creates a PDF file from a specific sheet and saves it to a designated Google Drive folder.
+ * @param {Spreadsheet} spreadsheet The Google Spreadsheet object containing the sheet.
+ * @param {Sheet} sheet The specific Sheet object to convert to PDF.
+ * @param {Folder} folder The Google Drive Folder object to save the PDF into.
+ * @return {boolean} True if PDF creation was successful, false otherwise.
+ */
+function createPdf(spreadsheet, sheet, folder) {
+  const functionName = "createPdf";
+  try {
+    SpreadsheetApp.flush(); // Ensure all pending changes are written
+
+    const sheetId = sheet.getSheetId();
+    const spreadsheetId = spreadsheet.getId();
+    const pdfName = `${sheet.getName()}.pdf`;
+
+    // Construct the PDF export URL with specific parameters
+    const url = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?` +
+              `format=pdf` +
+              `&gid=${sheetId}` +             // Export only this specific sheet
+              `&size=A4` +                  // Paper size
+              `&portrait=false` +           // Landscape orientation
+              `&fitw=true` +                // Fit content width to page
+              `&sheetnames=false` +         // Do not show sheet names
+              `&printtitle=false` +         // Do not show spreadsheet title
+              `&gridlines=false` +          // Do not show gridlines
+              `&horizontal_alignment=CENTER` + // Center horizontally
+              `&top_margin=0.4` +           // Narrow margins (in inches)
+              `&bottom_margin=0.4` +
+              `&left_margin=0.4` +
+              `&right_margin=0.4`;
+
+    // Set up request parameters including authorization
+    const params = {
+      method: "GET",
+      headers: { "Authorization": "Bearer " + ScriptApp.getOAuthToken() },
+      muteHttpExceptions: true // Prevent script termination on HTTP errors (e.g., 404)
+    };
+
+    // Fetch the PDF content from the URL
+    const response = UrlFetchApp.fetch(url, params);
+    const responseCode = response.getResponseCode();
+
+    // Check if the request was successful
+    if (responseCode === 200) {
+        const blob = response.getBlob().setName(pdfName);
+        folder.createFile(blob); // Save the PDF blob to the specified folder
+        Logger.log(`${functionName}: Successfully created PDF: ${pdfName} in folder ${folder.getName()}`);
+        return true; // Indicate success
+    } else {
+        // Log failure details
+        Logger.log(`${functionName}: Failed to create PDF (HTTP ${responseCode}) for sheet: ${sheet.getName()}. URL: ${url}. Response: ${response.getContentText()}`);
+        Browser.msgBox(`PDF Creation Error: Failed to generate PDF for "${sheet.getName()}" (HTTP Status: ${responseCode}). Check logs for details.`);
+        return false; // Indicate failure
+    }
+
+  } catch (e) {
+    // Log unexpected errors during PDF creation
+    Logger.log(`${functionName}: Unexpected error creating PDF for sheet: ${sheet.getName()}. Error: ${e.message}\n${e.stack}`);
+    Browser.msgBox(`PDF Creation Error: An unexpected error occurred while creating PDF for "${sheet.getName()}": ${e.message}`);
+    return false; // Indicate failure
+  }
+}
+
+// =================================================================
+// ★ Helper Function: Updates the status tag in the source sheet ★
+// =================================================================
+/**
+ * Updates the status column (Z) for specified rows in the source sheet.
+ * @param {Sheet} sheet The source Google Sheet object (Management Table).
+ * @param {Array<number>} rowNumbers An array of row numbers to update.
+ * @param {string} tag The status tag to write (e.g., "承認待ち").
+ */
+function updateTags(sheet, rowNumbers, tag) {
+  const functionName = "updateTags";
+  if (!rowNumbers || rowNumbers.length === 0) {
+    Logger.log(`${functionName}: No row numbers provided for tag update.`);
+    return; // Nothing to update
+  }
+
+  try {
+    const TAG_COLUMN_LETTER = "Z"; // Status column
+
+    // Create an array of range strings (e.g., ["Z5", "Z8", "Z12"])
+    const ranges = rowNumbers.map(rowNum => `${TAG_COLUMN_LETTER}${rowNum}`);
+
+    // Update all specified cells in one go using RangeList
+    sheet.getRangeList(ranges).setValue(tag);
+    SpreadsheetApp.flush(); // Ensure changes are saved immediately
+    Logger.log(`${functionName}: Successfully updated tag to "${tag}" for rows: ${rowNumbers.join(", ")}`);
+
+  } catch (e) {
+    // Log errors during tag update
+    Logger.log(`${functionName}: Failed to update tags for rows: ${rowNumbers.join(", ")}. Error: ${e.message}\n${e.stack}`);
+    Browser.msgBox(`Status Update Error: Failed to update status in the source sheet. Error: ${e.message}`);
+  }
+}
